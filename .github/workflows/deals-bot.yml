@@ -2,47 +2,32 @@ name: E-Commerce Deals Bot
 
 on:
   schedule:
-    # ─── Deal alerts every 30 minutes ───────────────────────────────
-    - cron: '0,30 * * * *'        # Every 30 mins (deals)
-    
-    # ─── Trending product — 9:00 AM IST (3:30 AM UTC) ───────────────
-    - cron: '30 3 * * *'          # 9:00 AM IST daily
-    
-    # ─── Combo/BOGO deal — 2:00 PM IST (8:30 AM UTC) ────────────────
-    - cron: '30 8 * * *'          # 2:00 PM IST daily
+    - cron: '0,30 * * * *'   # Every 30 mins — deals
+    - cron: '30 3 * * *'     # 9:00 AM IST — trending
+    - cron: '30 8 * * *'     # 2:00 PM IST — combo
 
-  # Allow manual trigger from GitHub UI
   workflow_dispatch:
     inputs:
       mode:
-        description: 'Run mode: deals / trending / combo / all'
-        required: false
-        default: 'deals'
+        description: 'deals / trending / combo / all'
+        required: true
+        default: 'all'        # ← default is now ALL so you can test everything at once
 
 jobs:
-  # ─── JOB 1: Regular Deal Alerts (every 30 mins) ─────────────────────────────
+
+  # ── DEAL ALERTS (every 30 mins OR manual) ───────────────────────────────────
   deal-alerts:
     name: Deal Alerts (40-99% + ₹1)
     runs-on: ubuntu-latest
-    if: |
+    if: >
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'schedule' && 
-       contains(github.event.schedule, '0,30'))
-    
+      (github.event_name == 'schedule' && github.event.schedule == '0,30 * * * *')
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: 'pip'
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Run Deal Alerts
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12', cache: 'pip' }
+      - run: pip install -r requirements.txt
+      - name: Run
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
@@ -51,56 +36,38 @@ jobs:
           MODE="${{ github.event.inputs.mode || 'deals' }}"
           python src/bot.py $MODE
 
-  # ─── JOB 2: Trending Product (9 AM IST) ─────────────────────────────────────
+  # ── TRENDING (9 AM IST OR manual with mode=trending) ────────────────────────
   trending-alert:
     name: 🔥 Trending Product of the Day
     runs-on: ubuntu-latest
-    if: |
-      github.event_name == 'schedule' && 
-      contains(github.event.schedule, '30 3')
-
+    if: >
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'trending') ||
+      (github.event_name == 'schedule' && github.event.schedule == '30 3 * * *')
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: 'pip'
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Send Trending Alert
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12', cache: 'pip' }
+      - run: pip install -r requirements.txt
+      - name: Run Trending
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
           EARNKARO_API_KEY: ${{ secrets.EARNKARO_API_KEY }}
         run: python src/bot.py trending
 
-  # ─── JOB 3: Combo/BOGO Deal (2 PM IST) ──────────────────────────────────────
+  # ── COMBO (2 PM IST OR manual with mode=combo) ──────────────────────────────
   combo-alert:
     name: 🎁 Combo/BOGO Deal of the Day
     runs-on: ubuntu-latest
-    if: |
-      github.event_name == 'schedule' && 
-      contains(github.event.schedule, '30 8')
-
+    if: >
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'combo') ||
+      (github.event_name == 'schedule' && github.event.schedule == '30 8 * * *')
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: 'pip'
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Send Combo Alert
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12', cache: 'pip' }
+      - run: pip install -r requirements.txt
+      - name: Run Combo
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
