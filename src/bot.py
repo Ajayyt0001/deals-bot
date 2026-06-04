@@ -1,473 +1,338 @@
 """
-E-Commerce Deals Telegram Bot
-Monitors deals from multiple platforms and sends notifications
+E-Commerce Deals Bot v4 — Fixed deal detection + Telegram
 """
-
-import os
-import re
-import json
-import time
-import logging
-import requests
-import feedparser
-from datetime import datetime, timedelta
-from pytrends.request import TrendReq
+import os, re, json, time, logging, urllib.request, urllib.parse, urllib.error
+from datetime import datetime
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ─── CONFIG (set as GitHub Secrets / Environment Variables) ───────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "")
-EARNKARO_API_KEY = os.environ.get("EARNKARO_API_KEY", "")
+EARNKARO_API_KEY    = os.environ.get("EARNKARO_API_KEY", "")
+MIN_DISCOUNT = 40
 
-MIN_DISCOUNT = 40       # Minimum discount % to alert
-MAX_DISCOUNT = 99       # Maximum discount % to alert
-ONE_RUPEE_THRESHOLD = 2 # Alert if price <= ₹1 (use 2 for safety margin)
-
-# ─── DEAL SOURCES (RSS Feeds — no API key needed) ────────────────────────────
-DEAL_FEEDS = [
-    {
-        "name": "Desidime",
-        "url": "https://www.desidime.com/deals.rss",
-        "type": "rss"
-    },
-    {
-        "name": "Dealnloot", 
-        "url": "https://www.dealnloot.com/feed",
-        "type": "rss"
-    },
-    {
-        "name": "Dealsucker",
-        "url": "https://dealsucker.in/feed/",
-        "type": "rss"
-    },
-    {
-        "name": "GrabOn",
-        "url": "https://www.grabon.in/deals/feed/",
-        "type": "rss"
-    },
-]
-
-# ─── PLATFORM KEYWORDS ────────────────────────────────────────────────────────
-PLATFORM_KEYWORDS = {
-    "amazon": "🛒 Amazon",
-    "flipkart": "🛍️ Flipkart",
-    "myntra": "👗 Myntra",
-    "meesho": "🛒 Meesho",
-    "ajio": "👔 Ajio",
-    "nykaa": "💄 Nykaa",
-    "zepto": "⚡ Zepto",
-    "blinkit": "🟡 Blinkit",
-    "instamart": "🟠 Instamart",
-    "jiomart": "🔵 JioMart",
-    "tatacliq": "🔷 Tata Cliq",
-    "snapdeal": "💢 Snapdeal",
-    "bigbasket": "🟢 BigBasket",
-    "shein": "✨ SHEIN",
-}
-
-COMBO_KEYWORDS = [
-    "buy 1 get 1", "bogo", "buy one get one", "combo", "bundle",
-    "pack of 2", "pack of 3", "pack of 4", "set of", "2 in 1",
-    "free with", "get free", "combo pack", "value pack",
-    "buy 2 get 1", "buy 3 get 1", "buy 2 get 2"
-]
-
-# ─── EARNKARO AFFILIATE LINK CONVERTER ───────────────────────────────────────
-def get_affiliate_link(product_url: str) -> str:
-    """Convert product URL to EarnKaro affiliate link"""
+# ── HTTP ──────────────────────────────────────────────────────────────────────
+def http_get(url, timeout=20):
     try:
-        if not EARNKARO_API_KEY:
-            return product_url
-        
-        api_url = "https://api.earnkaro.com/v2/getAffiliateLink"
-        headers = {
-            "Authorization": f"Bearer {EARNKARO_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        payload = {"url": product_url}
-        
-        resp = requests.post(api_url, json=payload, headers=headers, timeout=10)
-        data = resp.json()
-        
-        if data.get("status") == "success" and data.get("affiliateUrl"):
-            return data["affiliateUrl"]
-        else:
-            logger.warning(f"EarnKaro API: {data}")
-            return product_url
+        req = urllib.request.Request(url, headers={'User-Agent':'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read().decode('utf-8', errors='ignore')
     except Exception as e:
-        logger.error(f"EarnKaro error: {e}")
-        return product_url
-
-# ─── PRICE PARSER ─────────────────────────────────────────────────────────────
-def extract_prices(text: str):
-    """Extract original price, discounted price, and discount % from text"""
-    # Find prices like ₹999, Rs.999, INR 999
-    price_pattern = r'(?:₹|Rs\.?|INR\s*)\s*(\d+(?:,\d+)*(?:\.\d+)?)'
-    prices = re.findall(price_pattern, text, re.IGNORECASE)
-    prices = [int(p.replace(',', '').split('.')[0]) for p in prices]
-    
-    # Find discount % like 50% off, 75% discount
-    discount_pattern = r'(\d+)\s*%\s*(?:off|discount|cashback)'
-    discounts = re.findall(discount_pattern, text, re.IGNORECASE)
-    discounts = [int(d) for d in discounts]
-    
-    original_price = max(prices) if prices else None
-    discounted_price = min(prices) if len(prices) > 1 else None
-    discount_pct = max(discounts) if discounts else None
-    
-    # Calculate discount if not found
-    if original_price and discounted_price and not discount_pct:
-        if original_price > 0:
-            discount_pct = int(((original_price - discounted_price) / original_price) * 100)
-    
-    return original_price, discounted_price, discount_pct
-
-# ─── DETECT PLATFORM ──────────────────────────────────────────────────────────
-def detect_platform(text: str, url: str = "") -> str:
-    combined = (text + " " + url).lower()
-    for key, label in PLATFORM_KEYWORDS.items():
-        if key in combined:
-            return label
-    return "🛒 Online Store"
-
-# ─── DETECT COMBO DEAL ────────────────────────────────────────────────────────
-def is_combo_deal(text: str) -> tuple:
-    text_lower = text.lower()
-    for keyword in COMBO_KEYWORDS:
-        if keyword in text_lower:
-            return True, keyword.upper()
-    return False, None
-
-# ─── FETCH IMAGE FROM URL ─────────────────────────────────────────────────────
-def extract_image_from_entry(entry) -> str:
-    """Try to get image URL from RSS entry"""
-    # Try media content
-    if hasattr(entry, 'media_content') and entry.media_content:
-        return entry.media_content[0].get('url', '')
-    
-    # Try enclosures
-    if hasattr(entry, 'enclosures') and entry.enclosures:
-        for enc in entry.enclosures:
-            if 'image' in enc.get('type', ''):
-                return enc.get('url', '')
-    
-    # Try to extract from summary HTML
-    if hasattr(entry, 'summary'):
-        img_match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', entry.summary)
-        if img_match:
-            return img_match.group(1)
-    
-    return ""
-
-# ─── SEND TELEGRAM MESSAGE ────────────────────────────────────────────────────
-def send_telegram_photo(image_url: str, caption: str):
-    """Send photo with caption to Telegram channel"""
-    try:
-        if image_url:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-            payload = {
-                "chat_id": TELEGRAM_CHANNEL_ID,
-                "photo": image_url,
-                "caption": caption,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": False
-            }
-        else:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            payload = {
-                "chat_id": TELEGRAM_CHANNEL_ID,
-                "text": caption,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": False
-            }
-        
-        resp = requests.post(url, json=payload, timeout=15)
-        result = resp.json()
-        
-        if not result.get("ok"):
-            # If photo fails, fall back to text
-            if image_url and "wrong file identifier" in str(result):
-                return send_telegram_photo("", caption)
-            logger.error(f"Telegram error: {result}")
-            return False
-        return True
-    except Exception as e:
-        logger.error(f"Telegram send error: {e}")
-        return False
-
-# ─── FORMAT DEAL MESSAGE ──────────────────────────────────────────────────────
-def format_deal_message(title, platform, original_price, discounted_price, 
-                         discount_pct, affiliate_link, badge="", deal_type=""):
-    lines = []
-    
-    if badge:
-        lines.append(badge)
-    
-    lines.append(f"<b>{title[:200]}</b>")
-    lines.append(f"")
-    lines.append(f"🏪 Platform: {platform}")
-    
-    if discounted_price and discounted_price <= 1:
-        lines.append(f"💰 Price: <b>₹{discounted_price} 🤯 (ALMOST FREE!)</b>")
-    elif discounted_price:
-        lines.append(f"💰 Price: <s>₹{original_price}</s> → <b>₹{discounted_price}</b>")
-    elif original_price:
-        lines.append(f"💰 Price: <b>₹{original_price}</b>")
-    
-    if discount_pct:
-        if discount_pct >= 80:
-            lines.append(f"🔥 Discount: <b>{discount_pct}% OFF</b> 🔥")
-        elif discount_pct >= 60:
-            lines.append(f"💥 Discount: <b>{discount_pct}% OFF</b>")
-        else:
-            lines.append(f"📉 Discount: <b>{discount_pct}% OFF</b>")
-    
-    if deal_type:
-        lines.append(f"🎁 Deal Type: <b>{deal_type}</b>")
-    
-    lines.append(f"")
-    lines.append(f"🔗 <a href='{affiliate_link}'>👉 GRAB THIS DEAL</a>")
-    lines.append(f"")
-    lines.append(f"⏰ {datetime.now().strftime('%d %b %Y, %I:%M %p')}")
-    lines.append(f"#deals #discount #sale #{platform.split()[-1].lower()}")
-    
-    return "\n".join(lines)
-
-# ─── FETCH & PROCESS DEALS ────────────────────────────────────────────────────
-def fetch_deals():
-    """Fetch deals from all RSS feeds and filter by discount"""
-    all_deals = []
-    
-    for source in DEAL_FEEDS:
-        try:
-            logger.info(f"Fetching from {source['name']}...")
-            feed = feedparser.parse(source['url'])
-            
-            for entry in feed.entries[:30]:  # Check last 30 entries per feed
-                title = entry.get('title', '')
-                summary = entry.get('summary', '')
-                link = entry.get('link', '')
-                image = extract_image_from_entry(entry)
-                
-                full_text = f"{title} {summary}"
-                
-                # Extract prices and discount
-                original_price, discounted_price, discount_pct = extract_prices(full_text)
-                
-                # Check ₹1 deal
-                is_one_rupee = discounted_price and discounted_price <= ONE_RUPEE_THRESHOLD
-                
-                # Check discount range
-                is_valid_discount = discount_pct and MIN_DISCOUNT <= discount_pct <= MAX_DISCOUNT
-                
-                if is_valid_discount or is_one_rupee:
-                    platform = detect_platform(full_text, link)
-                    is_combo, combo_type = is_combo_deal(full_text)
-                    
-                    all_deals.append({
-                        "title": title,
-                        "summary": summary,
-                        "link": link,
-                        "image": image,
-                        "platform": platform,
-                        "original_price": original_price,
-                        "discounted_price": discounted_price,
-                        "discount_pct": discount_pct,
-                        "is_one_rupee": is_one_rupee,
-                        "is_combo": is_combo,
-                        "combo_type": combo_type,
-                        "source": source['name']
-                    })
-            
-            time.sleep(1)  # Polite delay between feeds
-            
-        except Exception as e:
-            logger.error(f"Error fetching {source['name']}: {e}")
-    
-    return all_deals
-
-# ─── GOOGLE TRENDING PRODUCT ──────────────────────────────────────────────────
-def get_trending_product():
-    """Get top Google trending product in India and find a deal for it"""
-    try:
-        pytrends = TrendReq(hl='en-IN', tz=330, timeout=(10, 25))
-        
-        # Get trending searches in India
-        trending = pytrends.trending_searches(pn='india')
-        
-        if trending is None or trending.empty:
-            return None
-        
-        # Filter for product-like trends (exclude news/events)
-        trending_list = trending[0].tolist()[:10]
-        
-        product_keywords = []
-        for term in trending_list:
-            term_lower = term.lower()
-            # Skip news/sports/political terms
-            skip_words = ['ipl', 'match', 'vs', 'election', 'news', 'death', 'accident', 'weather']
-            if not any(skip in term_lower for skip in skip_words):
-                product_keywords.append(term)
-        
-        if not product_keywords:
-            return None
-        
-        top_trend = product_keywords[0]
-        logger.info(f"Top trending: {top_trend}")
-        
-        # Search for this product on Amazon via affiliate search URL
-        amazon_search = f"https://www.amazon.in/s?k={top_trend.replace(' ', '+')}"
-        affiliate_link = get_affiliate_link(amazon_search)
-        
-        return {
-            "keyword": top_trend,
-            "search_link": affiliate_link,
-            "all_trends": trending_list[:5]
-        }
-    except Exception as e:
-        logger.error(f"Google Trends error: {e}")
+        logger.error(f"GET {url[:50]}: {e}")
         return None
 
-# ─── SEND TRENDING ALERT ──────────────────────────────────────────────────────
-def send_trending_alert():
-    """Send daily trending product alert"""
-    trend = get_trending_product()
-    if not trend:
-        logger.warning("No trending data found")
-        return
-    
-    other_trends = ", ".join(trend['all_trends'][1:5])
-    
-    message = f"""🔥 <b>TRENDING IN INDIA TODAY</b> 🔥
+def http_post(url, data, headers=None):
+    try:
+        body = json.dumps(data).encode()
+        h = {'Content-Type':'application/json'}
+        if headers: h.update(headers)
+        req = urllib.request.Request(url, data=body, headers=h, method='POST')
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        err = e.read().decode()
+        logger.error(f"POST {e.code}: {err}")
+        return {"ok": False, "description": err}
+    except Exception as e:
+        logger.error(f"POST error: {e}")
+        return {"ok": False}
 
-📈 <b>#{trend['keyword']}</b> is trending on Google!
+# ── TELEGRAM ──────────────────────────────────────────────────────────────────
+def tg_validate():
+    html = http_get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe")
+    if html:
+        d = json.loads(html)
+        if d.get("ok"):
+            logger.info(f"✅ Bot OK: @{d['result']['username']}")
+            return True
+    logger.error(f"❌ Bot token invalid!")
+    return False
 
-🛒 Find the best deals for this product:
-🔗 <a href='{trend['search_link']}'>👉 SHOP {trend['keyword'].upper()}</a>
+def tg_send(text, photo=None):
+    if photo:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+        r = http_post(url, {"chat_id": TELEGRAM_CHANNEL_ID, "photo": photo,
+                            "caption": text[:1024], "parse_mode": "HTML"})
+        if not r.get("ok"):
+            # fallback without photo
+            return tg_send(text)
+    else:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        r = http_post(url, {"chat_id": TELEGRAM_CHANNEL_ID, "text": text[:4096],
+                            "parse_mode": "HTML", "disable_web_page_preview": True})
+    if r.get("ok"):
+        logger.info("✅ Sent to Telegram")
+        return True
+    logger.error(f"❌ Telegram failed: {r}")
+    return False
 
-📊 Also trending: {other_trends}
+# ── AFFILIATE ─────────────────────────────────────────────────────────────────
+def affiliate(url):
+    if not EARNKARO_API_KEY or not url: return url
+    r = http_post("https://api.earnkaro.com/v2/getAffiliateLink",
+                  {"url": url}, {"Authorization": f"Bearer {EARNKARO_API_KEY}"})
+    if r and r.get("status") == "success":
+        return r.get("affiliateUrl", url)
+    return url
 
-⏰ {datetime.now().strftime('%d %b %Y, %I:%M %p')}
-#trending #google #dealstoday"""
-    
-    send_telegram_photo("", message)
-    logger.info("Trending alert sent!")
+# ── PRICE EXTRACTION — IMPROVED ───────────────────────────────────────────────
+def extract_discount(text):
+    """
+    Returns (original, discounted, pct) using multiple strategies
+    """
+    # Clean HTML
+    clean = re.sub(r'<[^>]+>', ' ', text)
 
-# ─── SEND COMBO DEAL ALERT ────────────────────────────────────────────────────
-def send_combo_alert(deals: list):
-    """Pick best combo deal and send daily alert"""
-    combo_deals = [d for d in deals if d['is_combo']]
-    
-    if not combo_deals:
-        logger.info("No combo deals found today")
-        return
-    
-    # Pick best combo (highest discount)
-    best_combo = sorted(combo_deals, key=lambda x: x.get('discount_pct') or 0, reverse=True)[0]
-    
-    affiliate_link = get_affiliate_link(best_combo['link'])
-    
-    message = format_deal_message(
-        title=best_combo['title'],
-        platform=best_combo['platform'],
-        original_price=best_combo['original_price'],
-        discounted_price=best_combo['discounted_price'],
-        discount_pct=best_combo['discount_pct'],
-        affiliate_link=affiliate_link,
-        badge="🎁 <b>COMBO DEAL OF THE DAY</b> 🎁",
-        deal_type=best_combo['combo_type']
-    )
-    
-    send_telegram_photo(best_combo['image'], message)
-    logger.info("Combo deal alert sent!")
+    # Strategy 1: explicit % off
+    pct_matches = re.findall(r'(\d+)\s*%\s*(?:off|discount|cashback|savings?)', clean, re.I)
+    pct = max([int(p) for p in pct_matches if 10 <= int(p) <= 99], default=None)
 
-# ─── MAIN RUNNER ──────────────────────────────────────────────────────────────
-def run_deal_alerts():
-    """Main function — fetch deals and send alerts"""
-    logger.info("Starting deal fetch...")
-    deals = fetch_deals()
-    logger.info(f"Found {len(deals)} qualifying deals")
-    
-    sent_count = 0
-    
-    for deal in deals:
+    # Strategy 2: two prices (MRP vs sale)
+    price_matches = re.findall(r'(?:₹|Rs\.?|MRP|INR)\s*(\d[\d,]*)', clean, re.I)
+    prices = sorted(set(int(p.replace(',','')) for p in price_matches if int(p.replace(',','')) > 0))
+
+    orig = disc = None
+    if len(prices) >= 2:
+        orig = max(prices)
+        disc = min(prices)
+        if not pct and orig > disc:
+            pct = int(((orig - disc) / orig) * 100)
+    elif len(prices) == 1:
+        disc = prices[0]
+
+    # Strategy 3: "was X now Y" pattern
+    was_now = re.search(r'(?:was|MRP|original)[^\d]*(\d[\d,]+)[^\d]+(?:now|offer|sale)[^\d]*(\d[\d,]+)', clean, re.I)
+    if was_now:
+        o, d = int(was_now.group(1).replace(',','')), int(was_now.group(2).replace(',',''))
+        if o > d > 0:
+            orig, disc = o, d
+            pct = int(((o - d) / o) * 100)
+
+    return orig, disc, pct
+
+def detect_platform(text):
+    t = text.lower()
+    for k, v in [("amazon","🛒 Amazon"),("flipkart","🛍️ Flipkart"),
+                  ("myntra","👗 Myntra"),("meesho","🛒 Meesho"),
+                  ("ajio","👔 Ajio"),("nykaa","💄 Nykaa"),
+                  ("zepto","⚡ Zepto"),("blinkit","🟡 Blinkit"),
+                  ("jiomart","🔵 JioMart"),("bigbasket","🟢 BigBasket"),
+                  ("tatacliq","🔷 Tata Cliq"),("snapdeal","💢 Snapdeal")]:
+        if k in t: return v
+    return "🛒 Online Store"
+
+def detect_combo(text):
+    for k in ["buy 1 get 1","bogo","combo","bundle","pack of","2 in 1",
+              "free with","buy 2","value pack","buy one get"]:
+        if k in text.lower(): return k.upper()
+    return None
+
+def get_image(entry_text):
+    m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', entry_text, re.I)
+    return m.group(1) if m else ""
+
+# ── FEED SOURCES ──────────────────────────────────────────────────────────────
+FEEDS = [
+    ("Desidime",   "https://www.desidime.com/deals.rss"),
+    ("Dealnloot",  "https://www.dealnloot.com/feed"),
+    ("Dealsucker", "https://dealsucker.in/feed/"),
+    ("Slickdeals", "https://slickdeals.net/newsearch.php?mode=frontpage&searcharea=deals&searchin=first&rss=1"),
+]
+
+def parse_feed(name, url):
+    deals = []
+    xml = http_get(url)
+    if not xml:
+        logger.warning(f"{name}: no response")
+        return deals
+
+    # Extract all items
+    items = re.findall(r'<item>(.*?)</item>', xml, re.DOTALL)
+    logger.info(f"{name}: {len(items)} items in feed")
+
+    for item in items[:50]:
+        # Title
+        t = re.search(r'<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>', item, re.DOTALL)
+        title = re.sub(r'<[^>]+>', '', t.group(1)).strip() if t else ""
+
+        # Link
+        l = re.search(r'<link>(https?://[^\s<]+)</link>', item)
+        if not l:
+            l = re.search(r'<guid[^>]*>(https?://[^\s<]+)</guid>', item)
+        link = l.group(1).strip() if l else ""
+
+        # Description
+        d = re.search(r'<description>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</description>', item, re.DOTALL)
+        desc = d.group(1) if d else ""
+
+        full = f"{title} {desc}"
+        image = get_image(desc)
+
+        orig, disc, pct = extract_discount(full)
+        is_one_rs = disc and disc <= 2
+        valid = (pct and pct >= MIN_DISCOUNT) or is_one_rs
+
+        if valid:
+            logger.info(f"  ✅ DEAL: {title[:60]} | {pct}% off | ₹{disc}")
+            deals.append({
+                "title": title[:250], "link": link, "image": image,
+                "orig": orig, "disc": disc, "pct": pct,
+                "is_one_rs": is_one_rs,
+                "platform": detect_platform(full + link),
+                "combo": detect_combo(full),
+                "source": name
+            })
+        else:
+            logger.debug(f"  skip: {title[:50]} | pct={pct} disc={disc}")
+
+    return deals
+
+# ── FORMAT ────────────────────────────────────────────────────────────────────
+def fmt(deal, badge="💰 <b>DEAL ALERT</b>"):
+    p = deal
+    lines = [badge, "", f"<b>{p['title']}</b>", "", f"🏪 {p['platform']}"]
+
+    if p.get('is_one_rs'):
+        lines.append(f"💰 Price: <b>₹{p['disc']} 🤯 ALMOST FREE!</b>")
+    elif p.get('disc') and p.get('orig') and p['orig'] != p['disc']:
+        lines.append(f"💰 <s>₹{p['orig']}</s> → <b>₹{p['disc']}</b>")
+    elif p.get('disc'):
+        lines.append(f"💰 Price: <b>₹{p['disc']}</b>")
+
+    if p.get('pct'):
+        e = "🔥" if p['pct'] >= 70 else "💥" if p['pct'] >= 50 else "📉"
+        lines.append(f"{e} Discount: <b>{p['pct']}% OFF</b>")
+
+    if p.get('combo'):
+        lines.append(f"🎁 Deal: <b>{p['combo']}</b>")
+
+    lnk = affiliate(p['link']) if p.get('link') else "#"
+    lines += ["", f"🔗 <a href='{lnk}'>👉 GRAB THIS DEAL</a>", "",
+              f"📦 Source: {p['source']}",
+              f"⏰ {datetime.now().strftime('%d %b %Y %I:%M %p IST')}",
+              "#deals #sale #discount"]
+    return "\n".join(lines)
+
+# ── TRENDING ──────────────────────────────────────────────────────────────────
+def run_trending():
+    logger.info("Fetching Google Trends...")
+    try:
+        from pytrends.request import TrendReq
+        pt = TrendReq(hl='en-IN', tz=330, timeout=(10,25))
+        df = pt.trending_searches(pn='india')
+        if df is None or df.empty:
+            logger.warning("No trends data"); return
+
+        skip = ['ipl','match','vs','election','news','death','accident','score','weather']
+        trends = [t for t in df[0].tolist()[:15]
+                  if not any(s in t.lower() for s in skip)]
+        if not trends:
+            logger.warning("No product trends"); return
+
+        top = trends[0]
+        link = affiliate(f"https://www.amazon.in/s?k={urllib.parse.quote(top)}")
+        others = ", ".join(trends[1:5])
+
+        msg = f"""🔥 <b>TRENDING IN INDIA TODAY</b> 🔥
+
+📈 <b>#{top.replace(' ','_')}</b> is trending on Google India!
+
+🛒 Shop now:
+🔗 <a href='{link}'>👉 {top.upper()} — Best Deals</a>
+
+📊 Also trending: {others}
+
+⏰ {datetime.now().strftime('%d %b %Y %I:%M %p IST')}
+#trending #googletrends #dealstoday"""
+        tg_send(msg)
+        logger.info(f"Trending sent: {top}")
+    except Exception as e:
+        logger.error(f"Trending error: {e}")
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
+def run_deals():
+    logger.info("="*50)
+    logger.info("E-COMMERCE DEALS BOT STARTING")
+    logger.info(f"TOKEN  : {'SET' if TELEGRAM_BOT_TOKEN else '❌ MISSING'}")
+    logger.info(f"CHANNEL: {TELEGRAM_CHANNEL_ID or '❌ MISSING'}")
+    logger.info(f"EARNKARO: {'SET' if EARNKARO_API_KEY else 'not set'}")
+    logger.info("="*50)
+
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
+        raise ValueError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHANNEL_ID!")
+
+    if not tg_validate():
+        raise ValueError("Bot token is INVALID — update the secret on GitHub!")
+
+    # Startup ping
+    tg_send(f"🤖 <b>Deals Bot Running!</b>\n⏰ {datetime.now().strftime('%d %b %Y %I:%M %p IST')}\n🔍 Scanning deals now...")
+
+    # Fetch from all feeds
+    all_deals = []
+    for name, url in FEEDS:
         try:
-            affiliate_link = get_affiliate_link(deal['link'])
-            
-            if deal['is_one_rupee']:
-                badge = "🤯 <b>₹1 DEAL ALERT!</b> 🤯"
-            elif deal.get('discount_pct', 0) >= 80:
-                badge = "🔥 <b>MEGA DEAL ALERT</b> 🔥"
+            found = parse_feed(name, url)
+            all_deals += found
+            logger.info(f"{name}: {len(found)} qualifying deals")
+        except Exception as e:
+            logger.error(f"{name} error: {e}")
+
+    # Remove duplicates by title similarity
+    seen = set()
+    unique = []
+    for d in all_deals:
+        key = d['title'][:40].lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(d)
+
+    logger.info(f"Total unique deals: {len(unique)}")
+
+    if not unique:
+        tg_send("ℹ️ <b>No deals</b> matching 40%+ discount found this run.\n🔄 Next check in 30 minutes.")
+        return
+
+    # Sort: ₹1 first, then by discount %
+    unique.sort(key=lambda x: (not x.get('is_one_rs'), -(x.get('pct') or 0)))
+
+    sent = 0
+    for deal in unique[:15]:
+        try:
+            if deal.get('is_one_rs'):
+                badge = "🤯 <b>₹1 DEAL — ALMOST FREE!</b>"
+            elif (deal.get('pct') or 0) >= 80:
+                badge = "🔥 <b>MEGA DEAL — 80%+ OFF!</b>"
+            elif (deal.get('pct') or 0) >= 60:
+                badge = "💥 <b>HOT DEAL ALERT</b>"
             else:
                 badge = "💰 <b>DEAL ALERT</b>"
-            
-            message = format_deal_message(
-                title=deal['title'],
-                platform=deal['platform'],
-                original_price=deal['original_price'],
-                discounted_price=deal['discounted_price'],
-                discount_pct=deal['discount_pct'],
-                affiliate_link=affiliate_link,
-                badge=badge
-            )
-            
-            success = send_telegram_photo(deal['image'], message)
-            
-            if success:
-                sent_count += 1
-                logger.info(f"Sent deal: {deal['title'][:50]}")
-                time.sleep(3)  # Avoid Telegram rate limiting
-            
+
+            ok = tg_send(fmt(deal, badge), deal.get('image') or None)
+            if ok:
+                sent += 1
+                time.sleep(2)
         except Exception as e:
-            logger.error(f"Error sending deal: {e}")
-    
-    logger.info(f"Done! Sent {sent_count} deal alerts")
-    return sent_count
+            logger.error(f"Send error: {e}")
 
-def run_trending():
-    """Run trending product alert (called at 9 AM)"""
-    logger.info("Running trending alert...")
-    send_trending_alert()
+    tg_send(f"✅ <b>Done!</b> Sent <b>{sent} deals</b> this run.\n🕐 Next check in 30 mins.")
+    logger.info(f"Finished: {sent}/{len(unique)} sent")
 
-def run_combo(deals=None):
-    """Run combo deal alert (called at 2 PM)"""
-    logger.info("Running combo deal alert...")
-    if deals is None:
-        deals = fetch_deals()
-    send_combo_alert(deals)
-
-# ─── ENTRY POINT ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import sys
-    
     mode = sys.argv[1] if len(sys.argv) > 1 else "deals"
-    
     if mode == "trending":
-        run_trending()
+        if tg_validate(): run_trending()
     elif mode == "combo":
-        run_combo()
-    elif mode == "deals":
-        run_deal_alerts()
-    elif mode == "all":
-        deals = fetch_deals()
-        send_trending_alert()
-        send_combo_alert(deals)
-        # Send all deals
-        for deal in deals:
-            try:
-                affiliate_link = get_affiliate_link(deal['link'])
-                message = format_deal_message(
-                    title=deal['title'],
-                    platform=deal['platform'],
-                    original_price=deal['original_price'],
-                    discounted_price=deal['discounted_price'],
-                    discount_pct=deal['discount_pct'],
-                    affiliate_link=affiliate_link,
-                    badge="💰 <b>DEAL ALERT</b>"
-                )
-                send_telegram_photo(deal['image'], message)
-                time.sleep(3)
-            except Exception as e:
-                logger.error(f"Error: {e}")
+        if tg_validate():
+            all_d = []
+            for n, u in FEEDS:
+                all_d += parse_feed(n, u)
+            combos = [d for d in all_d if d.get('combo')]
+            if combos:
+                best = sorted(combos, key=lambda x: x.get('pct') or 0, reverse=True)[0]
+                tg_send(fmt(best, "🎁 <b>COMBO / BOGO DEAL OF THE DAY</b> 🎁"), best.get('image'))
+            else:
+                logger.info("No combo deals today")
+    else:
+        run_deals()
